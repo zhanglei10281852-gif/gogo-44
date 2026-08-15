@@ -382,15 +382,38 @@ func (s *Store) recoverLocked() (Recovery, error) {
 	if err := s.loadSnapshotLocked(&recovery); err != nil {
 		return recovery, err
 	}
+	snapshotUsed := recovery.SnapshotUsed
+	snapshotSequence := recovery.Verification.SnapshotSequence
 	verification, events, err := readAndVerifyJournal(s.cfg.JournalPath())
 	if err != nil {
 		return recovery, err
 	}
 	recovery.Verification = verification
-	for _, event := range events {
-		if event.Sequence <= s.sequence {
-			continue
+	recovery.Verification.SnapshotSequence = snapshotSequence
+	if snapshotUsed {
+		if snapshotSequence > uint64(len(events)) {
+			return recovery, fmt.Errorf("snapshot sequence %d exceeds journal length %d", snapshotSequence, len(events))
 		}
+		expectedHash := ""
+		if snapshotSequence > 0 {
+			expectedHash = events[snapshotSequence-1].Hash
+		}
+		if s.lastHash != expectedHash {
+			return recovery, fmt.Errorf("snapshot hash does not match journal prefix at sequence %d", snapshotSequence)
+		}
+		replayed := &Store{jobs: make(map[string]*model.Job), idempotency: make(map[string]IdempotencyRecord)}
+		for _, event := range events[:snapshotSequence] {
+			if err := replayed.applyEventLocked(event); err != nil {
+				return recovery, fmt.Errorf("verify snapshot prefix event %d: %w", event.Sequence, err)
+			}
+			replayed.sequence = event.Sequence
+			replayed.lastHash = event.Hash
+		}
+		if !sameSnapshotState(replayed.jobs, replayed.idempotency, s.jobs, s.idempotency) {
+			return recovery, errors.New("snapshot state does not match replayed journal prefix")
+		}
+	}
+	for _, event := range events[s.sequence:] {
 		if event.PreviousHash != s.lastHash {
 			return recovery, fmt.Errorf("journal event %d does not continue snapshot hash", event.Sequence)
 		}
@@ -407,6 +430,19 @@ func (s *Store) recoverLocked() (Recovery, error) {
 	recovery.JobsRecovered = len(s.jobs)
 	return recovery, nil
 }
+
+func sameSnapshotState(leftJobs map[string]*model.Job, leftIdempotency map[string]IdempotencyRecord, rightJobs map[string]*model.Job, rightIdempotency map[string]IdempotencyRecord) bool {
+	left, leftErr := json.Marshal(struct {
+		Jobs        map[string]*model.Job
+		Idempotency map[string]IdempotencyRecord
+	}{leftJobs, leftIdempotency})
+	right, rightErr := json.Marshal(struct {
+		Jobs        map[string]*model.Job
+		Idempotency map[string]IdempotencyRecord
+	}{rightJobs, rightIdempotency})
+	return leftErr == nil && rightErr == nil && bytes.Equal(left, right)
+}
+
 func (s *Store) loadSnapshotLocked(recovery *Recovery) error {
 	data, err := os.ReadFile(s.cfg.SnapshotPath())
 	if errors.Is(err, os.ErrNotExist) {
